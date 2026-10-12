@@ -287,6 +287,30 @@ function playAnimation(name) {
   currentAction = next;
 }
 
+// วัด bounding box จริงของโมเดล (รองรับ SkinnedMesh ที่มีสเกลกระดูก เช่น โมเดลจาก Mixamo)
+function measureBounds(root) {
+  const box = new THREE.Box3();
+  const v = new THREE.Vector3();
+  root.updateMatrixWorld(true);
+  root.traverse((o) => {
+    if (!o.isMesh || !o.geometry) return;
+    if (o.isSkinnedMesh && o.skeleton && typeof o.getVertexPosition === 'function') {
+      o.skeleton.update();
+      const count = o.geometry.attributes.position.count;
+      const step = Math.max(1, Math.floor(count / 20000)); // สุ่มจุดให้เร็วขึ้นถ้าโมเดลใหญ่
+      for (let i = 0; i < count; i += step) {
+        o.getVertexPosition(i, v);
+        v.applyMatrix4(o.matrixWorld);
+        box.expandByPoint(v);
+      }
+    } else {
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      box.union(o.geometry.boundingBox.clone().applyMatrix4(o.matrixWorld));
+    }
+  });
+  return box;
+}
+
 function loadModel(name) {
   setStatus('กำลังโหลดโมเดล...');
   deselect();
@@ -300,12 +324,15 @@ function loadModel(name) {
     }
     const root = gltf.scene;
 
-    // ปรับขนาด + วางบนแท่น
-    let bb = new THREE.Box3().setFromObject(root);
+    // ปรับขนาด + วางบนแท่น (วัดขนาดจริงหลังกระดูกดึงโมเดลแล้ว)
+    root.updateMatrixWorld(true);
+    let bb = measureBounds(root);
     const size = bb.getSize(new THREE.Vector3());
-    const s = MODEL_HEIGHT / (size.y || 1);
-    root.scale.multiplyScalar(s);
-    bb = new THREE.Box3().setFromObject(root);
+    if (isFinite(size.y) && size.y > 0) {
+      root.scale.multiplyScalar(MODEL_HEIGHT / size.y);
+    }
+    root.updateMatrixWorld(true);
+    bb = measureBounds(root);
     const center = bb.getCenter(new THREE.Vector3());
     root.position.x -= center.x;
     root.position.z -= center.z;
@@ -314,6 +341,7 @@ function loadModel(name) {
     root.traverse((o) => {
       if (o.isMesh) {
         o.castShadow = o.receiveShadow = true;
+        if (o.isSkinnedMesh) o.frustumCulled = false;
         selectable.push(o);
       }
     });
