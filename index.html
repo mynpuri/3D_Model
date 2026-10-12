@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Next Gen Rendering — PBR Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1b1f; font-family: system-ui, "Noto Sans Thai", sans-serif; }
+  canvas { display: block; }
+  #title { position: fixed; top: 12px; left: 16px; color: #fff; pointer-events: none; text-shadow: 0 1px 6px rgba(0,0,0,.6); }
+  #title h1 { margin: 0; font-size: 18px; }
+  #title p { margin: 4px 0 0; font-size: 12px; opacity: .85; }
+  #help { position: fixed; left: 12px; bottom: 12px; max-width: 320px; padding: 10px 14px; border-radius: 10px;
+          background: rgba(30,30,34,.78); color: #ddd; font-size: 12px; line-height: 1.7; border: 1px solid rgba(255,255,255,.2); pointer-events: none; }
+  #help b { color: #fff; }
+  #status { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #fff; font-size: 16px;
+            background: rgba(0,0,0,.55); padding: 10px 18px; border-radius: 10px; display: none; }
+  #credit { position: fixed; right: 12px; bottom: 6px; color: rgba(255,255,255,.5); font-size: 11px; pointer-events: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="title">
+  <h1>Next Gen Rendering — PBR Viewer</h1>
+  <p>WebGL / Three.js · glTF model · PBR Shader (Base Color / Metallic / Roughness) + HDRI skybox</p>
+</div>
+<div id="help">
+  <b>ลาก</b> หมุนกล้อง · <b>สกอลล์</b> ซูม<br>
+  <b>คลิกวัตถุ</b> เลือกแล้วแก้ Base Color / Metallic / Roughness<br>
+  <b>ลากทรงกลมสีทอง</b> ย้ายตำแหน่งไฟ
+</div>
+<div id="status">กำลังโหลด...</div>
+<div id="credit">Models &amp; HDRI: three.js examples</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+
+/* ================= ตั้งค่าโมเดล / HDRI (แก้ตรงนี้ได้) ================= */
+const BASE = 'https://cdn.jsdelivr.net/gh/mrdoob/three.js@r160/examples/';
+const MODELS = {
+  'Robot Expressive': BASE + 'models/gltf/RobotExpressive/RobotExpressive.glb',
+  'Soldier':          BASE + 'models/gltf/Soldier.glb',
+  'Damaged Helmet':   BASE + 'models/gltf/DamagedHelmet/glTF/DamagedHelmet.gltf',
+  'ไฟล์ของฉัน (model.glb)': './model.glb'   // วางไฟล์ model.glb ไว้โฟลเดอร์เดียวกับ index.html
+};
+const HDRIS = {
+  'Royal Esplanade': BASE + 'textures/equirectangular/royal_esplanade_1k.hdr',
+  'Venice Sunset':   BASE + 'textures/equirectangular/venice_sunset_1k.hdr',
+  'Quarry':          BASE + 'textures/equirectangular/quarry_01_1k.hdr'
+};
+const MODEL_HEIGHT = 2;      // ปรับขนาดโมเดลให้สูงประมาณนี้
+const PLATFORM_TOP = 0.12;   // ความสูงของแท่นวางโมเดล
+/* ==================================================================== */
+
+const statusEl = document.getElementById('status');
+const setStatus = (t) => { statusEl.textContent = t || ''; statusEl.style.display = t ? 'block' : 'none'; };
+
+/* ---------- Renderer / Scene / Camera ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const dom = renderer.domElement;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2a2a2e);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 200);
+const CAM_START = new THREE.Vector3(3.8, 2.4, 5.2);
+const TARGET_START = new THREE.Vector3(0, 1, 0);
+camera.position.copy(CAM_START);
+
+/* ---------- Gizmo drag (ต้องผูกก่อน OrbitControls เพื่อให้ปิด controls ได้ทัน) ---------- */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const dragPlane = new THREE.Plane();
+const dragOffset = new THREE.Vector3();
+const hitPoint = new THREE.Vector3();
+const tmpV = new THREE.Vector3();
+let draggingLight = false;
+let downPos = { x: 0, y: 0 };
+
+function setMouse(e) {
+  const r = dom.getBoundingClientRect();
+  mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(mouse, camera);
+}
+
+dom.addEventListener('pointerdown', (e) => {
+  downPos = { x: e.clientX, y: e.clientY };
+  if (!gizmo.visible) return;
+  setMouse(e);
+  if (raycaster.intersectObject(gizmo)[0]) {
+    draggingLight = true;
+    controls.enabled = false;
+    camera.getWorldDirection(tmpV).negate();
+    dragPlane.setFromNormalAndCoplanarPoint(tmpV, gizmo.position);
+    raycaster.ray.intersectPlane(dragPlane, hitPoint);
+    dragOffset.copy(gizmo.position).sub(hitPoint);
+    dom.setPointerCapture(e.pointerId);
+  }
+}, true);
+
+dom.addEventListener('pointermove', (e) => {
+  if (!draggingLight) return;
+  setMouse(e);
+  if (raycaster.ray.intersectPlane(dragPlane, hitPoint)) {
+    gizmo.position.copy(hitPoint).add(dragOffset);
+    light.position.copy(gizmo.position);
+    lightState.x = +gizmo.position.x.toFixed(2);
+    lightState.y = +gizmo.position.y.toFixed(2);
+    lightState.z = +gizmo.position.z.toFixed(2);
+    cX.updateDisplay(); cY.updateDisplay(); cZ.updateDisplay();
+  }
+});
+
+dom.addEventListener('pointerup', (e) => {
+  if (draggingLight) {
+    draggingLight = false;
+    controls.enabled = true;
+    return;
+  }
+  const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+  if (moved < 5) pickObject(e);
+});
+
+const controls = new OrbitControls(camera, dom);
+controls.enableDamping = true;
+controls.target.copy(TARGET_START);
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 1.5;
+controls.maxDistance = 20;
+controls.update();
+
+/* ---------- Environment (HDRI) ---------- */
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+let envTex = null;       // PMREM texture (ใช้ส่องสะท้อนวัตถุ)
+let bgTex = null;        // equirect texture (ใช้เป็นพื้นหลัง)
+
+const envState = { hdri: Object.keys(HDRIS)[0], showBg: true, exposure: 1, envIntensity: 1 };
+
+function applyEnvToMaterials() {
+  scene.traverse((o) => {
+    if (!o.isMesh || o === gizmo) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    mats.forEach((m) => {
+      if (m && m.isMeshStandardMaterial) {
+        m.envMap = envTex;
+        m.envMapIntensity = envState.envIntensity;
+        m.needsUpdate = true;
+      }
+    });
+  });
+}
+
+function updateBackground() {
+  scene.background = envState.showBg && bgTex ? bgTex : new THREE.Color(0x2a2a2e);
+}
+
+function loadHDRI(name) {
+  setStatus('กำลังโหลด HDRI...');
+  new RGBELoader().load(HDRIS[name], (tex) => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    if (bgTex) bgTex.dispose();
+    if (envTex) envTex.dispose();
+    bgTex = tex;
+    envTex = pmrem.fromEquirectangular(tex).texture;
+    scene.environment = envTex;
+    scene.backgroundBlurriness = 0.3;
+    updateBackground();
+    applyEnvToMaterials();
+    setStatus('');
+  }, undefined, () => setStatus('โหลด HDRI ไม่สำเร็จ (เช็คอินเทอร์เน็ต)'));
+}
+
+/* ---------- ฉาก: พื้น แท่น และวัตถุประกอบ ---------- */
+const selectable = [];
+
+const ground = new THREE.Mesh(
+  new THREE.CylinderGeometry(6, 6, 0.1, 96),
+  new THREE.MeshStandardMaterial({ color: 0x9a96a0, roughness: 0.55, metalness: 0 })
+);
+ground.position.y = -0.05;
+ground.receiveShadow = true;
+ground.name = 'Ground';
+scene.add(ground); selectable.push(ground);
+
+const platform = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.95, 1.05, PLATFORM_TOP, 64),
+  new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 0.4, metalness: 0.3 })
+);
+platform.position.y = PLATFORM_TOP / 2;
+platform.castShadow = platform.receiveShadow = true;
+platform.name = 'Platform';
+scene.add(platform); selectable.push(platform);
+
+const chrome = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.16, 0.16, 2, 48),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.12, metalness: 1 })
+);
+chrome.position.set(-1.7, 1, 0.4);
+chrome.castShadow = chrome.receiveShadow = true;
+chrome.name = 'Chrome Cylinder';
+scene.add(chrome); selectable.push(chrome);
+
+const box = new THREE.Mesh(
+  new THREE.BoxGeometry(0.9, 1.2, 0.5),
+  new THREE.MeshStandardMaterial({ color: 0xb5693c, roughness: 0.6, metalness: 0 })
+);
+box.position.set(1.7, 0.6, -0.4);
+box.rotation.y = -0.5;
+box.castShadow = box.receiveShadow = true;
+box.name = 'Box';
+scene.add(box); selectable.push(box);
+
+/* ---------- ตารางอ้างอิง PBR (Metallic x Roughness) ---------- */
+const chart = new THREE.Group();
+{
+  const N = 5, gap = 0.62;
+  const geo = new THREE.SphereGeometry(0.26, 48, 32);
+  for (let r = 0; r < N; r++) {
+    for (let c = 0; c < N; c++) {
+      const m = new THREE.MeshStandardMaterial({
+        color: 0xcfcfcf,
+        metalness: r / (N - 1),
+        roughness: Math.max(0.05, c / (N - 1))
+      });
+      const s = new THREE.Mesh(geo, m);
+      s.position.set((c - (N - 1) / 2) * gap, ((N - 1) / 2 - r) * gap, 0);
+      s.castShadow = true;
+      chart.add(s);
+    }
+  }
+  chart.position.set(0, 2, -3.4);
+  chart.visible = false;
+  scene.add(chart);
+}
+
+/* ---------- Key light + gizmo ---------- */
+const lightState = { x: 2.4, y: 3.2, z: 2, intensity: 40, color: '#fff2df', showGizmo: true };
+const light = new THREE.SpotLight(lightState.color, lightState.intensity, 0, Math.PI / 4, 0.5, 2);
+light.position.set(lightState.x, lightState.y, lightState.z);
+light.target.position.set(0, 1, 0);
+light.castShadow = true;
+light.shadow.mapSize.set(2048, 2048);
+light.shadow.bias = -0.0004;
+light.shadow.normalBias = 0.02;
+scene.add(light, light.target);
+
+const gizmo = new THREE.Mesh(
+  new THREE.SphereGeometry(0.12, 24, 16),
+  new THREE.MeshBasicMaterial({ color: 0xf2d28a })
+);
+gizmo.position.copy(light.position);
+scene.add(gizmo);
+
+/* ---------- โหลดโมเดล ---------- */
+const gltfLoader = new GLTFLoader();
+let currentModel = null;
+let mixer = null;
+let actions = {};
+let currentAction = null;
+const modelState = { model: Object.keys(MODELS)[0], animation: '-' };
+let animController = null;
+
+function playAnimation(name) {
+  if (!mixer || !actions[name]) return;
+  const next = actions[name];
+  if (currentAction && currentAction !== next) currentAction.fadeOut(0.3);
+  next.reset().fadeIn(0.3).play();
+  currentAction = next;
+}
+
+function loadModel(name) {
+  setStatus('กำลังโหลดโมเดล...');
+  deselect();
+  gltfLoader.load(MODELS[name], (gltf) => {
+    if (currentModel) {
+      scene.remove(currentModel);
+      currentModel.traverse((o) => {
+        const idx = selectable.indexOf(o);
+        if (idx >= 0) selectable.splice(idx, 1);
+      });
+    }
+    const root = gltf.scene;
+
+    // ปรับขนาด + วางบนแท่น
+    let bb = new THREE.Box3().setFromObject(root);
+    const size = bb.getSize(new THREE.Vector3());
+    const s = MODEL_HEIGHT / (size.y || 1);
+    root.scale.multiplyScalar(s);
+    bb = new THREE.Box3().setFromObject(root);
+    const center = bb.getCenter(new THREE.Vector3());
+    root.position.x -= center.x;
+    root.position.z -= center.z;
+    root.position.y += PLATFORM_TOP - bb.min.y;
+
+    root.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = o.receiveShadow = true;
+        selectable.push(o);
+      }
+    });
+    scene.add(root);
+    currentModel = root;
+    applyEnvToMaterials();
+
+    // อนิเมชัน (ถ้ามี)
+    mixer = null; actions = {}; currentAction = null;
+    const names = gltf.animations.map((a) => a.name);
+    if (gltf.animations.length) {
+      mixer = new THREE.AnimationMixer(root);
+      gltf.animations.forEach((clip) => { actions[clip.name] = mixer.clipAction(clip); });
+      const first = names.includes('Idle') ? 'Idle' : names[0];
+      modelState.animation = first;
+      playAnimation(first);
+    } else {
+      modelState.animation = '-';
+    }
+    if (animController) animController.destroy();
+    animController = gF.add(modelState, 'animation', names.length ? names : ['-']).name('Animation')
+      .onChange(playAnimation);
+    animController.setValue(modelState.animation);
+    setStatus('');
+  }, undefined, () => {
+    setStatus('โหลดโมเดลไม่สำเร็จ — เช็คชื่อไฟล์/พาธ');
+    setTimeout(() => setStatus(''), 3500);
+  });
+}
+
+/* ---------- เลือกวัตถุ + แก้ Material ---------- */
+let selectedMesh = null;
+let selectedMat = null;
+const matState = { object: '(ยังไม่ได้เลือก)', color: '#ffffff', metallic: 0, roughness: 1, envInt: 1 };
+
+function currentMaterialOf(mesh) {
+  const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  return m && m.isMeshStandardMaterial ? m : null;
+}
+
+function pickObject(e) {
+  setMouse(e);
+  const hits = raycaster.intersectObjects(selectable, false);
+  if (!hits.length) { deselect(); return; }
+  const mesh = hits[0].object;
+  const mat = currentMaterialOf(mesh);
+  if (!mat) return;
+  selectedMesh = mesh;
+  selectedMat = mat;
+  matState.object = mesh.name || mat.name || 'Mesh';
+  matState.color = '#' + mat.color.getHexString();
+  matState.metallic = mat.metalness;
+  matState.roughness = mat.roughness;
+  matState.envInt = mat.envMapIntensity;
+  gM.controllersRecursive().forEach((c) => c.updateDisplay());
+}
+
+function deselect() {
+  selectedMesh = null;
+  selectedMat = null;
+  matState.object = '(ยังไม่ได้เลือก)';
+  if (typeof gM !== 'undefined') gM.controllersRecursive().forEach((c) => c.updateDisplay());
+}
+
+/* ---------- GUI ---------- */
+const gui = new GUI({ title: 'PBR Controls' });
+
+const gF = gui.addFolder('Model');
+gF.add(modelState, 'model', Object.keys(MODELS)).name('Model').onChange(loadModel);
+
+const gE = gui.addFolder('Environment / Skybox');
+gE.add(envState, 'hdri', Object.keys(HDRIS)).name('HDRI').onChange(loadHDRI);
+gE.add(envState, 'showBg').name('Show HDRI background').onChange(updateBackground);
+gE.add(envState, 'exposure', 0, 3, 0.01).name('Exposure').onChange((v) => { renderer.toneMappingExposure = v; });
+gE.add(envState, 'envIntensity', 0, 3, 0.01).name('Env. Intensity').onChange(applyEnvToMaterials);
+
+const gL = gui.addFolder('Key Light (drag the gold sphere)');
+const syncLight = () => { light.position.set(lightState.x, lightState.y, lightState.z); gizmo.position.copy(light.position); };
+const cX = gL.add(lightState, 'x', -8, 8, 0.1).name('Position X').onChange(syncLight);
+const cY = gL.add(lightState, 'y', 0.3, 10, 0.1).name('Position Y').onChange(syncLight);
+const cZ = gL.add(lightState, 'z', -8, 8, 0.1).name('Position Z').onChange(syncLight);
+gL.add(lightState, 'intensity', 0, 150, 1).name('Intensity').onChange((v) => { light.intensity = v; });
+gL.addColor(lightState, 'color').name('Color').onChange((v) => light.color.set(v));
+gL.add(lightState, 'showGizmo').name('Show gizmo').onChange((v) => { gizmo.visible = v; });
+
+const gM = gui.addFolder('Selected Material');
+gM.add(matState, 'object').name('Object').disable();
+gM.addColor(matState, 'color').name('Base Color').onChange((v) => { if (selectedMat) selectedMat.color.set(v); });
+gM.add(matState, 'metallic', 0, 1, 0.01).name('Metallic').onChange((v) => { if (selectedMat) selectedMat.metalness = v; });
+gM.add(matState, 'roughness', 0, 1, 0.01).name('Roughness').onChange((v) => { if (selectedMat) selectedMat.roughness = v; });
+gM.add(matState, 'envInt', 0, 3, 0.01).name('Env Map Intensity').onChange((v) => { if (selectedMat) selectedMat.envMapIntensity = v; });
+gM.add({ deselect }, 'deselect').name('Deselect');
+
+const sceneState = { autoRotate: false, chart: false };
+const gS = gui.addFolder('Scene');
+gS.add(sceneState, 'autoRotate').name('Auto-rotate view').onChange((v) => { controls.autoRotate = v; controls.autoRotateSpeed = 1.5; });
+gS.add(sceneState, 'chart').name('Show PBR reference chart').onChange((v) => { chart.visible = v; });
+gS.add({ reset() {
+  camera.position.copy(CAM_START);
+  controls.target.copy(TARGET_START);
+  controls.update();
+} }, 'reset').name('Reset camera');
+
+/* ---------- Start ---------- */
+loadHDRI(envState.hdri);
+loadModel(modelState.model);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
